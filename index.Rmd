@@ -1,0 +1,269 @@
+---
+title: 洛杉矶犯罪情况可视化分析
+author: tsing
+date: '2023-09-10'
+slug: ''
+categories: []
+tags: []
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE,message = FALSE,warning = FALSE)
+```
+
+# 注
+
+-   数据源于<a href="https://lacity.gov/visitors" target="_blank"><strong>洛杉政府官方网站</strong></a>，完整数据、代码均已打包托管于<a href="https://github.com/TsingData/blog2" target="_blank"><strong>GitHub</strong></a>。
+
+-   图片所配文字居于图片上方，一一对应。
+
+```{r}
+library(tidyverse)
+library(leaflet)
+library(tidytext)
+library(sf)
+library(naniar)
+library(tidytext)
+library(patchwork)
+library(gganimate)
+library(classInt)
+library(maptools)
+library(rgdal)
+library(tidyr)
+library(RColorBrewer)
+library(spdep)
+library(plyr)
+library(tmap)
+```
+
+
+# 介绍
+
+<p style="text-align:justify; text-indent:2em;">
+本数据收集了自 2010-01-01 00:01:00 UTC 到 2017-09-09 15:00:00 UTC 共计 1584316 条犯罪记录、 `26`项变量，本文将着重观测受害者的年龄组成与犯罪类型的关系、犯罪频率在时间层面的变化趋势 和 在空间层面的关联性。
+</p>
+
+```{r results='hide'}
+# crime1 <- read_csv("data_processed2.csv") #%>% 
+  # slice(1:1000)
+
+crime2 <- read_csv("Crime_Data_2010_20171.csv") 
+```
+
+
+```{r}
+color_palette <- c('vandalism'="#9b59b6", 'theft'="#3498db",
+                   'other'="#95a5a6", 'simple assault'="#e74c3c", 
+                   'Theft'="#34495e", 'aggravated assault'="#2ecc71")
+
+
+crime_map_fun_b <- function(LON,LAT,LOCATION,Crm_Type) {
+  leaflet() %>%
+    addTiles() %>%
+    addProviderTiles("Esri.WorldStreetMap") %>% 
+    setView(lng = mean(LON), lat = mean(LAT), zoom = 10) %>% 
+    addCircleMarkers(
+      lng = LON,
+      lat = LAT,
+      popup = paste("Location: ", LOCATION, "<br>Crm_Type: ",Crm_Type),
+      # clusterOptions = markerClusterOptions(),
+      #     color = ~pal(type)
+      fillOpacity = 0.5,
+      radius = 0.1,
+      color = unname(color_palette[Crm_Type])
+    )
+}
+```
+
+# 缺失值处理
+
+<p style="text-align:justify; text-indent:2em;">
+由于是由原始文件中抄出，数据存在多处缺失现象，所以在进行数据加工之前，先需进行缺失值进行处理。本文采用 `naniar` 包对缺失值进行检查。
+</p>
+
+<p style="text-align:justify; text-indent:2em;">
+由表格和图片可以看出, Crime Code 4、Crime Code 3 、Crime Code 2 、WeaponDescription、Weapon Used Code 缺失现象严重，缺失比例大于50%，因此将其从数据据中剔除。Mo Code、VictimDescent、VictimSex等则采用插补法进行补充。
+</p>
+
+```{r}
+crime2 %>% miss_var_summary() %>% arrange(desc(n_miss)) %>% head(6)
+crime2 %>%gg_miss_var() 
+```
+
+<p style="text-align:justify; text-indent:2em;">
+进行简单地剔除、插补过后，数据集中不再含有NA，可进行接下来的操作。
+</p>
+
+```{r}
+crime2 %>%
+  filter(!is.na(Location)) %>% 
+   mutate(Location_sec = str_remove_all(Location, "[\\(\\)]")) %>%
+  separate(Location_sec, into = c("Longitude", "Latitude"), sep = ", ", convert = TRUE)  -> crime3
+
+crime3 %>% 
+   rename_all(~ gsub(" ", "_", .)) %>% 
+  select(-where(~ mean(is.na(.)) > 0.5)) %>% 
+  na.omit(.) -> crime4
+crime4 %>% gg_miss_var()
+```
+
+# 犯罪情况在不同年龄段中的特征
+
+<p style="text-align:justify; text-indent:2em;">
+我们统计了在各个年龄段中，受害人遭遇到人生伤害或者财产损失情况。结果显示，青年人组中受害情况较多，中年人组其次，老年人组和青少年组情况则少很多，这可能和青年人和中年人早出晚归、工作生活忙碌的社会职责有关。
+</p>
+
+<p style="text-align:justify; text-indent:2em;">
+再者，我们发现 theft 和simple assault是定义的五类犯罪（simple assault、vandalism、theft、aggravated assault、other）中发生频次最高的犯罪，因此从一定程度上反映了当时洛杉矶市的经济发展有所不足。
+</p>
+
+```{r fig.width=12}
+crime4 %>% 
+  mutate(Age_Group = case_when(
+    Victim_Age >= 70 ~ "old",
+    Victim_Age >= 46 ~ "middle_age",
+    Victim_Age >= 18 ~ "youth",
+    Victim_Age >= 16 ~ "juvenile",
+    TRUE ~ "children"),.after =  Victim_Age) -> crime5
+
+crime5  %>%
+  mutate(Crime_Type = case_when(
+    grepl("simple assault", Crime_Code_Description, ignore.case = TRUE) ~ "simple assault",
+    grepl("vandalism", Crime_Code_Description, ignore.case = TRUE) ~ "vandalism",
+    grepl("theft|burglary", Crime_Code_Description, ignore.case = TRUE) ~ "theft",
+    grepl("aggravated assault", Crime_Code_Description, ignore.case = TRUE) ~ "aggravated assault",TRUE ~ "other"),
+    time = sprintf("%04d", .$Time_Occurred),
+    .after = Crime_Code_Description) -> crime6
+
+crime6 %>% 
+  mutate(Dt_tm = str_c(str_replace_all(Date_Occurred, "/" , ""),time) %>% mdy_hm(),
+         Crime_Year = year(Dt_tm),
+         Crime_Month = month(Dt_tm),
+         Crime_Day  = day(Dt_tm) ,.after = time) -> crime7
+crime7 %>%
+  dplyr::count(Age_Group, Crime_Type) %>% 
+  group_by(Age_Group) %>%
+  arrange(Age_Group, n) %>% 
+  ungroup() %>%
+  mutate(Crime_Type = reorder_within(Crime_Type,n,Age_Group)) %>%
+  ggplot(aes(x = Age_Group, y = n,  fill = Crime_Type)) +
+  geom_col(position = "dodge") +
+  geom_text(aes(label =n),position = position_dodge(width = 0.9), vjust = 0.5,angle = 90)+
+  theme_classic() -> Age_Group_Crime_Type_Count
+
+Age_Group_Crime_Type_Count
+```
+
+# 犯罪情况在时间尺度的变化特征
+
+<p style="text-align:justify; text-indent:2em;">
+从下图中可以看出，该市月案件数量保持在300左右，罕见出现激增或者锐减的现象。只有在每月月初时，案件数量较高，这可能是罪犯人员月末无法维持生计所致。
+</p>
+
+```{r}
+crime7 %>%
+  dplyr::count(Crime_Year,Crime_Month,Crime_Day) %>%
+  mutate(date = make_date(Crime_Year,Crime_Month),
+         Crime_Month = factor(Crime_Month),.before =Crime_Year ) %>% 
+ggplot(aes(Crime_Day, n, size =  n,color = Crime_Month))+
+  geom_point(alpha = 0.7, show.legend = FALSE) +
+  scale_size(range = c(3,9)) +
+    # scale_colour_manual(values = Crime_Month) +
+  scale_y_log10()+
+  labs(title = 'Time: {frame_time}', x = 'Crime_Day', y = 'Count') +
+  transition_time(date) +
+  ease_aes('linear')+
+  theme_classic()
+```
+
+# 犯罪情况在空间尺度的变化特征
+
+<p style="text-align:justify; text-indent:2em;">
+下图标记了案发现场的位置。不难看出，案发地均匀地散布在全市各地，只有零星地点案件数量较高，表明该市治安相对平稳。（数据量极大，图片放大缩小较慢）
+</p>
+
+```{r}
+crime <- crime6 %>% dplyr::sample_n(100000)
+crime_map_fun_b(crime$Latitude,crime$Longitude,crime$Address,crime$Crime_Type)#稍慢，大约20s
+```
+
+# 空间自回归
+
+<p style="text-align:justify; text-indent:2em;">
+接下来，我们将介绍如何利用空间相关性的方法来判定解洛杉矶的犯罪是否存在空间自相关性。
+</p>
+
+<p style="text-align:justify; text-indent:2em;">
+空间相关性的理论与托布勒地理学第一定律有着密不可分的关系。地理学第一定律表明“<strong>任何事物都与其他事物相关，但近处的事物比远处的事物更相关</strong>”
+</p>
+
+
+```{r}
+# head(districts@data, 5)
+
+w <- table(crime6$Reporting_District)
+rep.dis <- as.data.frame(w)
+# length(unique(rep.dis$Var1))
+# head(rep.dis, 5)
+```
+
+<p style="text-align:justify; text-indent:2em;">
+下图进一步证明，大多数地区报告的犯罪数量较少，零星有数量较高的现象，并且大多居于北部地区，这可能表明案件之间不存在自相关现象，表示数据空间分布的随机性。
+</p>
+
+```{r results='hide'}
+districts <- readOGR("./LRD/LAPD_Reporting_Districts.shp")
+```
+
+```{r }
+districts@data <- merge(districts@data, rep.dis, by.x = "REPDIST", by.y = "Var1", all.x = TRUE)
+districts$Freq[is.na(districts$Freq)] <- 0
+# length(districts$Freq)
+
+
+var <- districts@data[,"Freq"]
+breaks <- classIntervals(var, n = 9, style = "fisher")
+my_colours <- rev(brewer.pal(9, "RdBu"))
+plot(districts, col = my_colours[findInterval(var, breaks$brks, all.inside = TRUE)],   
+       axes = FALSE, border = NA)
+legend(x = -118.7, y = 34, legend = leglabs(breaks$brks), fill = my_colours, bty = "n", cex = 0.6)
+```
+
+
+
+<p style="text-align:justify; text-indent:2em;">
+这里采用莫氏检验检测地理单元之间的相关性，从结果可以看出，莫兰统计量为0.090，表明各地区的犯罪频率呈明显的随机分布。
+</p>
+
+```{r}
+neighbours <- poly2nb(districts)
+listw <- nb2listw(neighbours)
+# listw
+moran.test(districts$Freq, listw)
+```
+
+<p style="text-align:justify; text-indent:2em;">
+以下我们将使用莫兰图观察空间之间是否存在相关性；从图中可以看出，每个地区的犯罪频率大概率是随机的。
+</p>
+```{r}
+neighbours2 <- poly2nb(districts, queen = FALSE)
+moran <- moran.plot(districts$Freq, listw = nb2listw(neighbours2, style = "W"))
+```
+
+<p style="text-align:justify; text-indent:2em;">
+从下图我们可以看到，在洛杉矶各报告区中，地区的案件数量与邻近地区的犯罪数量之间几乎没有关系。只有在北部地区看到一些相似度较高的集群。
+</p>
+
+```{r}
+local <- localmoran(x = districts$Freq, listw = nb2listw(neighbours2, style = "W"))
+
+moran.map <- cbind(districts, local)
+
+tm_shape(moran.map) + tm_fill(col = "Ii", style = "quantile", title = "local moran statistic")
+```
+
+# 结论
+
+<p style="text-align:justify; text-indent:2em;">
+洛杉矶市自 2010-01-01 00:01:00 UTC 到 2017-09-09 15:00:00 UTC 期间，案件受害者中青年人与中年人偏多，案件类型中 theft 和 sample asault 居多；案件数量在时间尺度上长期处于月 300 起 的状态，月初案件数有所增加；案件数量空间尺度上同为均匀分布在全市各地，零星聚集在北部地区；采用莫兰检验证实，洛杉矶市各地区之间的案件数量并不存在空间相关性,属于完全随机现象。
+</p>
